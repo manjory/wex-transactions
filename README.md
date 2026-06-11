@@ -1,164 +1,141 @@
 # WEX Purchase Transaction Service
 
-A Spring Boot REST API for storing purchase transactions and retrieving them with real-time currency conversion using the [U.S. Treasury Reporting Rates of Exchange API](https://fiscaldata.treasury.gov/datasets/treasury-reporting-rates-exchange/treasury-reporting-rates-of-exchange).
+A Spring Boot REST API that stores purchase transactions in US dollars and retrieves them
+converted to any currency supported by the U.S. Treasury Reporting Rates of Exchange API.
 
-## Prerequisites
+---
+
+## The Problem
+
+Two things need to work:
+
+1. Accept a purchase transaction (description, date, amount) and store it with a unique ID.
+2. Given that ID and a target currency, return the transaction with the amount converted
+   using the Treasury exchange rate that was active on or before the purchase date.
+
+The Treasury API publishes exchange rates quarterly. The conversion must use the most recent
+rate that falls within 6 months before the purchase date. If no rate exists in that window,
+the API returns a clear error.
+
+---
+
+## Design Choices
+
+**Spring Boot + Java 21** - straightforward choice for a production REST service. Validation,
+JPA, and the test framework are all built in.
+
+**H2 file-based database** - runs with zero setup. Data persists across restarts in `./data/`.
+Switching to PostgreSQL requires changing four lines in `application.properties` and adding
+the driver dependency. No code changes needed.
+
+**UUID for transaction IDs** - avoids sequential IDs that leak record counts and are easy to
+enumerate. The database generates the UUID on insert.
+
+**Single Treasury API call per lookup** - the query pushes the date range filter, descending
+sort, and a page size of 1 directly to the Treasury API. One HTTP call returns exactly the
+right rate with no in-memory filtering.
+
+**Caffeine in-process cache** - since Treasury rates only change quarterly, the same
+currency + date pair will always return the same result. Responses are cached for 6 hours,
+which means a freshly published quarterly rate shows up within half a business day.
+
+**Apache HttpClient5** - gives configurable connect and read timeouts. The SSL truststore
+is pluggable via config so teams behind a corporate proxy can drop in their CA certificate
+without touching code.
+
+**WireMock in integration tests** - stubs the Treasury API at the HTTP level. Tests run
+fully offline with no flakiness from network or rate limits.
+
+---
+
+## Requirements
 
 - Java 21+
-- Maven 3.8+ (or use the included Maven Wrapper: `./mvnw`)
-
-## Quick Start
-
-```bash
-# Clone / unzip the project, then:
-cd wex-transactions
-
-# Run tests
-./mvnw test
-
-# Start the application
-./mvnw spring-boot:run
-```
-
-The API will be available at `http://localhost:8080`.
-
-> **H2 Console** (dev convenience): `http://localhost:8080/h2-console`  
-> JDBC URL: `jdbc:h2:file:./data/transactions`, Username: `sa`, Password: *(empty)*
-
----
-
-## API Reference
-
-### 1. Store a Purchase Transaction
-
-**`POST /api/v1/transactions`**
-
-Stores a new purchase transaction. The amount is rounded to the nearest cent.
-
-**Request Body:**
-```json
-{
-  "description": "Office Supplies",
-  "transactionDate": "2024-03-15",
-  "purchaseAmount": 99.99
-}
-```
-
-| Field | Type | Rules |
-|---|---|---|
-| `description` | String | Required, max 50 characters |
-| `transactionDate` | ISO date (`YYYY-MM-DD`) | Required, not in future |
-| `purchaseAmount` | Decimal | Required, positive value |
-
-**Response `201 Created`:**
-```json
-{
-  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "description": "Office Supplies",
-  "transactionDate": "2024-03-15",
-  "purchaseAmount": 99.99
-}
-```
-
----
-
-### 2. Retrieve a Transaction with Currency Conversion
-
-**`GET /api/v1/transactions/{id}?currency={country_currency_desc}`**
-
-Retrieves a stored transaction and converts the purchase amount to the specified currency using the Treasury exchange rate active on or before the transaction date (within the last 6 months).
-
-The `currency` parameter must match a `country_currency_desc` value from the Treasury API (e.g. `Canada-Dollar`, `Euro Zone-Euro`, `Japan-Yen`).
-
-**Example:**
-```
-GET /api/v1/transactions/a1b2c3d4-e5f6-7890-abcd-ef1234567890?currency=Canada-Dollar
-```
-
-**Response `200 OK`:**
-```json
-{
-  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "description": "Office Supplies",
-  "transactionDate": "2024-03-15",
-  "purchaseAmount": 99.99,
-  "exchangeRate": 1.3500,
-  "convertedAmount": 134.99,
-  "currency": "Dollar",
-  "country": "Canada"
-}
-```
-
-**Error responses:**
-- `404 Not Found` — transaction ID does not exist
-- `422 Unprocessable Entity` — no exchange rate available within 6 months of the purchase date
-
----
-
-### 3. List Available Currencies (Helper)
-
-**`GET /api/v1/currencies?date=2024-03-15`**
-
-Returns all available `country_currency_desc` values from the Treasury API for a given date. Useful for discovering valid values to pass to the conversion endpoint. Defaults to today if `date` is omitted.
-
----
-
-## Design Decisions
-
-### Currency Parameter
-The Treasury API uses `country_currency_desc` as a compound field (e.g. `Canada-Dollar`, `Euro Zone-Euro`). This is passed directly as the `currency` query param. The helper `/api/v1/currencies` endpoint lets callers discover valid values.
-
-### Exchange Rate Selection
-Per the spec, the API uses the most recent exchange rate **on or before** the purchase date, within the **last 6 months**. If no rate is found in that window, a `422` error is returned with a clear message.
-
-### Rounding
-- Purchase amounts are stored rounded to the nearest cent (HALF_UP).
-- Converted amounts are also rounded to two decimal places (HALF_UP).
-
-### Persistence
-Uses H2 file-based database by default (data persists across restarts in `./data/`). Swap to PostgreSQL or any other JPA-compatible database by updating `application.properties`.
+- Maven 3.8+ (or use `./mvnw` which delegates to your local Maven install)
 
 ---
 
 ## Running Tests
 
 ```bash
-# All tests (unit + integration)
-./mvnw test
-
-# With coverage report
-./mvnw test jacoco:report
-# Report at: target/site/jacoco/index.html
+./mvnw clean test
 ```
 
-The integration tests use **WireMock** to stub the Treasury API, so no network access is required to run tests.
+All 28 tests should pass. The integration tests use WireMock so no internet connection
+is needed.
 
-### Test Coverage
+To generate a coverage report:
 
-| Layer | Test Type |
-|---|---|
-| `PurchaseTransactionService` | Unit — Mockito |
-| `TreasuryExchangeRateService` | Unit — Mockito |
-| `PurchaseTransactionController` | Slice — `@WebMvcTest` + MockMvc |
-| End-to-end API flow | Integration — `@SpringBootTest` + WireMock |
+```bash
+./mvnw verify
+open target/site/jacoco/index.html
+```
 
 ---
 
-## Project Structure
+## Starting the Application
+
+```bash
+./mvnw spring-boot:run -Dspring-boot.run.profiles=dev
+```
+
+The API starts at `http://localhost:8080`.
+
+The `dev` profile enables the H2 console at `http://localhost:8080/h2-console`
+(JDBC URL: `jdbc:h2:file:./data/transactions`, username: `sa`, password: empty).
+
+---
+
+## API
+
+### Store a transaction
 
 ```
-src/
-├── main/java/com/wex/transactions/
-│   ├── TransactionApplication.java
-│   ├── config/           AppConfig.java (RestTemplate bean)
-│   ├── controller/       PurchaseTransactionController.java
-│   ├── dto/              Request/Response DTOs, Treasury API DTOs
-│   ├── exception/        Custom exceptions, GlobalExceptionHandler
-│   ├── model/            PurchaseTransaction (JPA entity)
-│   ├── repository/       PurchaseTransactionRepository
-│   └── service/          PurchaseTransactionService, TreasuryExchangeRateService
-└── test/java/com/wex/transactions/
-    ├── controller/       PurchaseTransactionControllerTest
-    ├── integration/      PurchaseTransactionIntegrationTest
-    └── service/          PurchaseTransactionServiceTest, TreasuryExchangeRateServiceTest
+POST /api/v1/transactions
 ```
+
+```json
+{
+  "description": "Office Supplies",
+  "transactionDate": "2024-03-15",
+  "purchaseAmount": 99.99
+}
+```
+
+Returns `201 Created` with the stored transaction including its generated UUID.
+
+### Retrieve with currency conversion
+
+```
+GET /api/v1/transactions/{id}?currency=Canada-Dollar
+```
+
+The `currency` parameter must match a `country_currency_desc` value from the Treasury API
+(for example `Canada-Dollar`, `Euro Zone-Euro`, `Japan-Yen`).
+
+Returns the transaction with `exchangeRate` and `convertedAmount` added.
+
+Returns `404` if the transaction does not exist, `422` if no exchange rate is available
+within 6 months of the purchase date.
+
+### Discover available currencies
+
+```
+GET /api/v1/currencies?date=2024-03-15
+```
+
+Returns all available `country_currency_desc` values for the given date. Useful for finding
+valid values to pass to the conversion endpoint.
+
+---
+
+## Future Work
+
+- **Schema migrations** - replace `ddl-auto=update` with Flyway or Liquibase for versioned,
+  auditable schema changes in production.
+- **Transaction list endpoint** - a paginated `GET /api/v1/transactions` was not in scope
+  but would be the obvious next addition.
+- **Distributed cache** - Caffeine is in-process. A multi-instance deployment would benefit
+  from Redis so all nodes share the same cached rates.
+- **Docker image** - a `Dockerfile` and `docker-compose.yml` with PostgreSQL would make
+  the production-like setup one command.
